@@ -29,9 +29,9 @@ Thư mục này chứa toàn bộ mã nguồn, dữ liệu dự đoán và báo 
 
 ```text
 submissions/
-├── README.md          # File hướng dẫn này
-├── results.xlsx       # Bảng tổng hợp chi tiết tất cả thí nghiệm
-├── report.md          # Báo cáo phân tích chi tiết (4-8 trang)
+├── README_submission.md          # File hướng dẫn chạy lại thí nghiệm
+├── results.xlsx                  # Bảng tổng hợp chi tiết tất cả thí nghiệm
+├── report.md                     # Báo cáo phân tích chi tiết (4-8 trang)
 ├── curves/            # Biểu đồ đường cong training (.png) của từng exp_id
 ├── predictions/       # File dự đoán CSV (.csv) phục vụ chấm điểm tự động
 └── code/              # Mã nguồn đã hoàn thiện
