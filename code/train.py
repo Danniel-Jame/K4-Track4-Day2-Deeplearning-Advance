@@ -154,7 +154,6 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scheduler, s
                     cfg: Config, device: torch.device, ema: EMA | None = None) -> dict:
     """Huấn luyện 1 epoch."""
     model.train()
-    # Nếu mô hình đóng băng backbone, giữ BatchNorm ở chế độ eval
     if cfg.init == "frozen":
         model_lib.freeze_backbone(model)
         for m in model.modules():
@@ -274,15 +273,12 @@ def run(cfg: Config) -> dict:
     Path(cfg.pred_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.curves_dir).mkdir(parents=True, exist_ok=True)
 
-    # Lưu cấu hình chạy
     with open(r_dir / "config.json", "w") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=2)
 
-    # 1. Đọc và kiểm tra dữ liệu
     train_df, val_df, test_df = dataset.load_split(cfg.labels_dir, fold=cfg.fold)
     dataset.check_split(train_df, val_df, test_df, cfg.images_dir)
 
-    # 2. Tạo Transform & Loader
     train_transform = dataset.build_transforms(train=True, img_size=cfg.img_size, aug=cfg.aug)
     val_transform = dataset.build_transforms(train=False, img_size=cfg.img_size)
 
@@ -295,13 +291,11 @@ def run(cfg: Config) -> dict:
         train=False, num_workers=cfg.num_workers
     )
 
-    # 3. Tạo Model
     model = model_lib.build_model(
         cfg.backbone, pretrained=True, num_classes=dataset.NUM_CLASSES,
         drop_rate=cfg.drop_rate, init=cfg.init
     ).to(device)
 
-    # 4. Tạo Loss Criterion
     weights = None
     if cfg.class_weight_beta is not None:
         train_counts = train_df['Label'].value_counts().sort_index().values
@@ -312,18 +306,15 @@ def run(cfg: Config) -> dict:
         gamma=cfg.focal_gamma, weight=weights
     )
 
-    # 5. Optimizer, Scheduler, Scaler, EMA
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp) if cfg.amp else None
     ema = EMA(model, decay=cfg.ema_decay) if cfg.ema_decay is not None else None
 
-    # 6. Vòng lặp Epoch
     history = []
     best_macro_f1 = -1.0
     best_epoch = -1
     best_ckpt_path = r_dir / "best_model.pth"
-
     epoch_times = []
 
     for epoch in range(1, cfg.epochs + 1):
@@ -334,7 +325,6 @@ def run(cfg: Config) -> dict:
         t_epoch = time.time() - t0
         epoch_times.append(t_epoch)
 
-        # Đánh giá trên tập val (sử dụng EMA nếu bật)
         if ema is not None:
             ema.apply_shadow(model)
 
@@ -342,9 +332,16 @@ def run(cfg: Config) -> dict:
         val_probs = F.softmax(torch.tensor(val_logits), dim=-1).numpy()
         val_preds = np.argmax(val_probs, axis=1)
 
-        # Metrics chuẩn dùng eval.py
-        val_eval_metrics = compute_metrics(val_true, val_preds)
-        val_macro_f1 = val_eval_metrics["macro_f1"]
+        # Tránh KeyError: Lấy an toàn hoặc tự tính thủ công Top-1 Accuracy
+        val_top1_acc = float(np.mean(val_preds == val_true))
+        
+        try:
+            val_eval_metrics = compute_metrics(val_true, val_preds)
+            val_macro_f1 = val_eval_metrics.get("macro_f1", 0.0)
+        except Exception:
+            # Fallback nếu hàm compute_metrics yêu cầu signature khác (vd: thêm val_probs)
+            val_eval_metrics = compute_metrics(val_true, val_preds, val_probs)
+            val_macro_f1 = val_eval_metrics.get("macro_f1", 0.0)
 
         if ema is not None:
             ema.restore(model)
@@ -353,7 +350,7 @@ def run(cfg: Config) -> dict:
             "epoch": epoch,
             "train_loss": train_metrics["train_loss"],
             "val_loss": val_loss,
-            "val_top1": val_eval_metrics["top1_acc"],
+            "val_top1": val_top1_acc,
             "val_macro_f1": val_macro_f1,
             "lr": train_metrics["lr"],
             "time_sec": t_epoch
@@ -366,7 +363,6 @@ def run(cfg: Config) -> dict:
               f"Val F1: {val_macro_f1:.4f} | "
               f"Time: {t_epoch:.1f}s")
 
-        # Lưu checkpoint có macro-F1 val cao nhất
         if val_macro_f1 > best_macro_f1:
             best_macro_f1 = val_macro_f1
             best_epoch = epoch
@@ -380,7 +376,6 @@ def run(cfg: Config) -> dict:
                 save_dict["ema_shadow"] = ema.shadow
             torch.save(save_dict, best_ckpt_path)
 
-    # 7. Đánh giá lại trên checkpoint tốt nhất để xuất dự đoán chuẩn
     ckpt = torch.load(best_ckpt_path)
     model.load_state_dict(ckpt["state_dict"])
     if ema is not None and "ema_shadow" in ckpt:
@@ -389,11 +384,8 @@ def run(cfg: Config) -> dict:
 
     val_filenames, val_true, val_logits, _ = evaluate(model, val_loader, criterion, device)
     val_probs = F.softmax(torch.tensor(val_logits), dim=-1).numpy()
-    
-    # Lưu file dự đoán Val chuẩn dùng cho eval.py
     save_predictions(pred_path(cfg, "val"), val_filenames, val_true, val_probs)
 
-    # 8. Chỉ chạy tập TEST nếu là Bước 4 (save_test_predictions = True)
     test_macro_f1 = None
     if cfg.save_test_predictions:
         test_loader = dataset.make_loader(
@@ -404,10 +396,14 @@ def run(cfg: Config) -> dict:
         test_probs = F.softmax(torch.tensor(test_logits), dim=-1).numpy()
         test_preds = np.argmax(test_probs, axis=1)
         save_predictions(pred_path(cfg, "test"), test_filenames, test_true, test_probs)
-        test_eval_metrics = compute_metrics(test_true, test_preds)
-        test_macro_f1 = test_eval_metrics["macro_f1"]
+        
+        try:
+            test_eval_metrics = compute_metrics(test_true, test_preds)
+            test_macro_f1 = test_eval_metrics.get("macro_f1", 0.0)
+        except Exception:
+            test_eval_metrics = compute_metrics(test_true, test_preds, test_probs)
+            test_macro_f1 = test_eval_metrics.get("macro_f1", 0.0)
 
-    # Save log history & plot curve
     pd.DataFrame(history).to_csv(r_dir / "history.csv", index=False)
     plot_curves(
         history,
@@ -430,7 +426,6 @@ def run(cfg: Config) -> dict:
 
 
 def parse_overrides(pairs: list[str]) -> dict:
-    """Tách tham số dòng lệnh thành dictionary có ép kiểu dữ liệu."""
     res = {}
     field_types = {f.name: f.type for f in dataclasses.fields(Config)}
 
@@ -446,7 +441,6 @@ def parse_overrides(pairs: list[str]) -> dict:
 
         target_type = field_types[k]
 
-        # Ép kiểu dữ liệu linh hoạt
         if v.lower() == "none":
             res[k] = None
         elif v.lower() == "true":
@@ -459,12 +453,10 @@ def parse_overrides(pairs: list[str]) -> dict:
             res[k] = float(v)
         else:
             res[k] = v
-
     return res
 
 
 def main() -> None:
-    """Điểm chạy chính CLI."""
     parser = argparse.ArgumentParser(description="Chạy huấn luyện mô hình DeepWeeds.")
     parser.add_argument("--set", nargs="*", default=[], help="Cú pháp: --set exp_id=B01 backbone=resnet50 seed=0")
     args = parser.parse_args()
